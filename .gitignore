@@ -1,0 +1,9 @@
+# 登录凭证，千万不要提交（里面是明文的 accessToken / refreshToken）
+auths/
+
+# Python 运行缓存
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
