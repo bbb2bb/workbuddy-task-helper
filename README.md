@@ -96,7 +96,7 @@ WorkBuddy任务助手/
 - 将执行结果整理为中文清单，细分任务状态，如把"已完成""之前已领""完成但领奖失败""需手动操作"等情形分开显示
 - 简化了操作流程，如取消了执行前的二次确认，并让脚本在执行完毕后自动返回清单
 
-我实际是从 [linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel) 下载的代码，该项目Sliverkiss/workbuddy2api的增强分支；本项目所用脚本与上游原始版本一致。
+我实际是从 [linguo2625469/workbuddy2api-panel](https://github.com/linguo2625469/workbuddy2api-panel) 下载的代码，该项目为 Sliverkiss/workbuddy2api 的增强分支；本项目所用脚本与上游原始版本一致。
 
 - `scripts/task_runner.py`、`scripts/task_common.py`、`scripts/school_open_day_2026.py` 直接取自上游，未做改动。上游更新时用新版覆盖这三个文件即可。
 - `scripts/任务助手.py`、`scripts/中文结果.py`、`scripts/login.py` 以及入口脚本、README 及使用说明为拆分后新增。
