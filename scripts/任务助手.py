@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""WorkBuddy 成长计划任务自动执行脚本（整合版）
+"""WorkBuddy 任务助手（整合版）
 
 双击上一层的「WorkBuddy任务助手.command」使用 —— 全项目只有这一个入口，
 登录、挑任务、批量跑全都在这里。
@@ -20,8 +20,8 @@
 把上游日志交给 中文结果.py 排成中文清单。
 
 编号说明：编号只在本次清单内有效，每次执行完重新查询、重新编号。
-        分组固定顺序：已经领过的 → 手动任务（前两段只展示，不编号、选不了）
-        → a 限时 → b 每日 → c 已完成待领 → d 不限时；字母可直接当命令（输 a = 做整段）。
+        分组固定顺序：已经领过的 → 手动任务 → 已完成的每日任务（前三段只展示，不编号、选不了）
+        → a 每日 → b 限时 → c 已完成待领 → d 不限时；字母按显示位置动态分配（谁排第一谁是 a），可直接当命令（输 a = 做整段）。
 """
 import datetime as dt
 import glob
@@ -43,6 +43,73 @@ import 中文结果 as zh                  # noqa: E402  结果翻译层（复�
 
 PY = sys.executable                   # 当前解释器已由 .command 保证 ≥3.10
 TZ = dt.timezone(dt.timedelta(hours=8))
+
+# 积分余额端点（fork cmd/credit：POST /v2/billing/meter/get-user-resource）。
+# 用来跑前/跑后对账真实入账增量——解析层对 school 域 claim / 抽奖等不带
+# credit= 字段的入账看不到，余额差是唯一权威口径。
+PATH_CREDIT = "/v2/billing/meter/get-user-resource"
+_CREDIT_BODY = {
+    "PageNumber": 1, "PageSize": 100, "ProductCode": "p_tcaca",
+    "Status": [0, 3],
+    # 时间窗：现在 → 101 年后，覆盖所有有效套餐
+    "PackageEndTimeRangeBegin": None,   # 运行时填 time.strftime
+    "PackageEndTimeRangeEnd": "2127-09-22 00:00:00",
+}
+
+
+def _credit_remain(auth):
+    """读账号当前积分余额（remain）。失败返回 None，不影响主流程。
+
+    响应 envelope：data.Response.Data.Accounts[].{Capacity*|CycleCapacity*}；
+    Cycle 期套餐用 CycleCapacityRemain，否则用 CapacityRemain（与上游
+    ResourceSummary 同口径）。
+    """
+    body = dict(_CREDIT_BODY)
+    body["PackageEndTimeRangeBegin"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        st, r = tc.do_post(auth, tc.billing_base(auth), PATH_CREDIT, body)
+    except Exception:
+        return None
+    if st != 200 or not isinstance(r, dict) or r.get("code") != 0:
+        return None
+    data = (r.get("data") or {}).get("Response") or {}
+    data = data.get("Data") or {}
+    remain = 0
+    for a in data.get("Accounts") or []:
+        if a.get("CycleCapacitySize"):
+            remain += a.get("CycleCapacityRemain") or 0
+        else:
+            remain += a.get("CapacityRemain") or 0
+    return remain
+
+
+def _balances(auth):
+    """读 (积分余额, 能量余额)；任一失败对应位给 None。两个只读 GET/POST 并发。"""
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fc = pool.submit(_credit_remain, auth)
+        fe = pool.submit(_energy_balance, auth)
+        return fc.result(), fe.result()
+
+
+def _energy_balance(auth):
+    """读能量余额（GET /v2/activity/growth/energy）。失败返回 None。"""
+    try:
+        st, r = tc.do_get(auth, tc.chat_base(auth), tr.PATH_ENERGY)
+        if st == 200 and isinstance(r, dict) and r.get("code") == 0:
+            return (r.get("data") or {}).get("balance")
+    except Exception:
+        pass
+    return None
+
+
+def _delta(before, after):
+    """余额前后差；任一为 None 返回 0（无法对账时留给逐任务相加兜底）。"""
+    if before is None or after is None:
+        return 0
+    try:
+        return int(after) - int(before)
+    except (TypeError, ValueError):
+        return 0
 
 W = 78                                # 整屏宽度
 NAME_W = 30                           # 任务名一列的上限（显示宽度）
@@ -166,6 +233,8 @@ def deadline_days(end):
 # --------------------------------------------------------------------------
 def ability(code):
     """这个任务脚本能不能自动做？返回 (能不能, 不能的原因)。"""
+    if code in FEAT_CODES:            # 功能型行（签到/旅行/抽奖/活跃地图）放行
+        return True, ""
     if code in MANUAL_NOTES:
         return False, MANUAL_NOTES[code]
     spec = tr.MAPPING.get(code)
@@ -233,6 +302,159 @@ def make_item(t, domain):
     }
 
 
+# --------------------------------------------------------------------------
+# 额外功能行（签到 / 猫猫旅行 / 开学季抽奖 / 活跃地图）
+#
+# 这些不是 task_runner 拉来的任务，是脚本自己加的「功能型」行，归进「a 每日」
+# 组展示。code 用 feat_ 前缀，ability() 放行、exec_selected() 拦截走 stub，
+# 与 task_runner 的 MAPPING 互不干扰。状态全部只读探查，执行逻辑另接。
+# --------------------------------------------------------------------------
+FEAT_CODES = ("feat_checkin", "feat_travel", "feat_school_lottery", "feat_streak")
+
+
+def _probe_travel(auth, base):
+    """GET /activity/growth/buddy/travel/status（只读）。返回 travel 状态 dict。"""
+    try:
+        st, r = tc.do_get(auth, base, "/activity/growth/buddy/travel/status")
+        if st == 200 and isinstance(r, dict) and r.get("code") == 0:
+            return (r.get("data") or {})
+    except Exception:
+        pass
+    return {}
+
+
+def _probe_streak(auth, base):
+    """GET /activity/growth/streak（只读）。返回连登+档位状态 dict。"""
+    try:
+        st, r = tc.do_get(auth, base, "/activity/growth/streak")
+        if st == 200 and isinstance(r, dict) and r.get("code") == 0:
+            data = (r.get("data") or {})
+            sk = data.get("streak") or {}
+            rs = data.get("redemption_status") or {}
+            return {
+                "days": sk.get("days") or 0,
+                "next_tier": sk.get("next_tier") or "",
+                "next_tier_remaining": sk.get("next_tier_remaining"),
+                "tiers_locked": all(
+                    rs.get("tier_%s_status" % t) == "locked"
+                    for t in ("7d", "14d", "28d")),
+                "makeup_cards": (data.get("makeup_cards") or {}).get("balance") or 0,
+            }
+    except Exception:
+        pass
+    return {}
+
+
+def _probe_lottery(auth):
+    """GET /portal/activity/school/config（只读）。返回抽奖余额 dict。"""
+    try:
+        import school_open_day_2026 as sk
+        cfg, chance = sk.fetch_lottery_config(auth["token"])
+        return {
+            "in_period": cfg.get("in_period"),
+            "balance": chance.get("balance") or 0,
+            "total_earned": chance.get("total_earned") or 0,
+            "end_at": cfg.get("end_at") or "",
+        }
+    except Exception:
+        pass
+    return {}
+
+
+def _travel_state_text(travel):
+    """把 travel/status 的返回翻成清单状态文字。"""
+    st = travel.get("state")
+    limit = travel.get("daily_limit_reached")
+    if st == "traveling":
+        loc = (travel.get("location") or {}).get("name") or "外出中"
+        arrive = travel.get("arrive_at") or 0
+        if arrive:
+            t = dt.datetime.fromtimestamp(arrive, TZ)
+            return "旅行中·%s·%s到站" % (loc, t.strftime("%H:%M"))
+        return "旅行中·%s" % loc
+    if st == "idle" and limit:
+        return "今日已派出"
+    return "可派出"
+
+
+def _feature_items(auth):
+    """探4个额外功能的只读状态，返回 feature item 列表。
+
+    每个 item 的 domain="feature"，code 用 feat_ 前缀，daily=True 归「a 每日」组。
+    feat_state 是清单屏显示的状态文字（state_text 优先用它）。
+    3 个端点并发探查（旅行/streak/lottery）；签到是幂等写，不探只读状态。
+    """
+    base = tc.chat_base(auth)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        f_travel = pool.submit(_probe_travel, auth, base)
+        f_streak = pool.submit(_probe_streak, auth, base)
+        f_lottery = pool.submit(_probe_lottery, auth)
+        travel = f_travel.result()
+        streak = f_streak.result()
+        lottery = f_lottery.result()
+
+    items = []
+
+    # 1) 每日签到（POST daily-checkin 幂等；只读无状态，执行时已签返回 10001）
+    items.append({
+        "code": "feat_checkin", "title": "每日签到", "domain": "feature",
+        "state": "todo", "feat_state": "每日可签", "cur": 0, "target": 0,
+        "credit": 100, "energy": 0, "deadline": "", "dl_days": None,
+        "repeat": True, "daily": True, "auto": True, "why": "",
+        "raw_state": "feature",
+    })
+
+    # 2) 猫猫旅行
+    items.append({
+        "code": "feat_travel", "title": "猫猫旅行", "domain": "feature",
+        "state": "todo", "feat_state": _travel_state_text(travel),
+        "cur": 0, "target": 0,
+        "credit": travel.get("reward_credit") or 0, "energy": 0,
+        "deadline": "", "dl_days": None, "repeat": True, "daily": True,
+        "auto": True, "why": "", "raw_state": "feature",
+    })
+
+    # 3) 开学季抽奖
+    bal = lottery.get("balance") or 0
+    in_period = lottery.get("in_period")
+    if not in_period:
+        feat_state = "活动已结束"
+        state = "claimed"
+    elif bal > 0:
+        feat_state = "抽奖余额 %d 次" % bal
+        state = "todo"
+    else:
+        feat_state = "无抽奖机会"
+        state = "claimed"
+    items.append({
+        "code": "feat_school_lottery", "title": "开学季小程序抽奖", "domain": "feature",
+        "state": state, "feat_state": feat_state, "cur": bal, "target": 0,
+        "credit": 0, "energy": 0, "deadline": "", "dl_days": None,
+        "repeat": False, "daily": True, "auto": True, "why": "",
+        "raw_state": "feature",
+    })
+
+    # 4) 活跃地图（连登天数 + 档位）
+    s_days = streak.get("days") or 0
+    s_next = streak.get("next_tier_remaining")
+    s_tier = (streak.get("next_tier") or "").replace("d", "天")
+    if s_days and s_next is not None:
+        feat_state = "连登%d天·距%s档还差%d天" % (s_days, s_tier, s_next)
+    elif s_days:
+        feat_state = "连登%d天" % s_days
+    else:
+        feat_state = "未开始连登"
+    items.append({
+        "code": "feat_streak", "title": "活跃地图", "domain": "feature",
+        "state": "todo", "feat_state": feat_state, "cur": s_days, "target": 0,
+        "credit": 0, "energy": 0, "deadline": "", "dl_days": None,
+        "repeat": True, "daily": True, "auto": True, "why": "",
+        "raw_state": "feature",
+    })
+
+    return items
+
+
 def collect(acc):
     """拉该账号的全部任务（只读，三个域合并）。返回 (items, energy_balance)。
 
@@ -292,24 +514,25 @@ def collect(acc):
             items.append(make_item(t, "school"))
             seen.add(t.get("task_code"))
 
-    return items, energy
+    return items + _feature_items(auth), energy
 
 
 # --------------------------------------------------------------------------
 # 分组：清单切成几段，每段有个字母代号，字母可以直接当命令用（输 a = 把 a 组全做掉）
 # --------------------------------------------------------------------------
-GROUP_ORDER = ["claimed", "manual", "a", "b", "c", "d"]
+GROUP_ORDER = ["claimed", "manual", "done_daily", "a", "b", "c", "d"]
 
 GROUP_NAMES = {
     "claimed": "已经领过的",
     "manual": "手动任务【脚本无法完成】",
-    "a": "限时任务",
-    "b": "每日任务",
+    "done_daily": "已完成的每日任务",
+    "a": "每日任务",
+    "b": "限时任务",
     "c": "已完成待领取任务",
     "d": "不限时任务",
 }
 
-LETTERED = ("a", "b", "c", "d")      # 只有这四个能当命令用；claimed / manual 只展示
+LETTERED = ("a", "b", "c", "d")      # 只有这四个能当命令用；claimed / manual / done_daily 只展示
 
 
 def group_of(it):
@@ -317,19 +540,20 @@ def group_of(it):
 
     claimed 已领过（不编号、选不了，只展示）
     manual  手动任务（脚本做不了，同样不编号、选不了，只展示）
+    done_daily 已完成的每日任务（每天重置的那种，今天已领过，排 manual 之后）
     c 已完成待领（进度满了只差领奖，白捡的，优先于 a/b/d）
-    a 限时 / b 每日 / d 不限时
+    a 每日 / b 限时 / d 不限时
     """
     if it["state"] == "claimed":
-        return "claimed"
+        return "done_daily" if it["daily"] else "claimed"
     if not it["auto"]:
         return "manual"
     if it["state"] == "claimable":
         return "c"
     if it["deadline"]:
-        return "a"
-    if it["daily"]:
         return "b"
+    if it["daily"]:
+        return "a"
     return "d"
 
 
@@ -337,7 +561,7 @@ def sort_key(it):
     """组顺序固定；组内「有截止的按最紧的先」，其余稳定按代码排。"""
     g = group_of(it)
     gi = GROUP_ORDER.index(g)
-    if g == "claimed":
+    if g in ("claimed", "done_daily"):
         return (gi, it["title"])
     dl = it["dl_days"] if it["dl_days"] is not None else 9999
     return (gi, dl, it["code"])
@@ -353,6 +577,8 @@ def reward_text(it):
 
 
 def state_text(it):
+    if it.get("feat_state"):          # 功能型行（签到/旅行/抽奖/活跃地图）
+        return it["feat_state"]
     if it["state"] == "claimed":
         return "已领过"
     if not it["auto"]:
@@ -372,7 +598,7 @@ def tail_text(it):
     parts = []
     if it["deadline"]:
         parts.append("[%s]" % it["deadline"])
-    if it["daily"]:
+    if it["daily"] and not it.get("code", "").startswith("feat_"):
         parts.append("每天可做")
     return "".join("　" + p for p in parts)
 
@@ -419,10 +645,13 @@ def fit_no_tail(it, prefix, name_w):
     return c
 
 
-def group_head(key, glist):
-    """组标题：a 限时任务　（3 个，共 +250 积分 +15 能量）"""
-    if key == "claimed":
-        return "已经领过的", "　（%d 个）" % len(glist)
+def group_head(key, glist, letter_map=None):
+    """组标题：a 每日任务　（3 个，共 +250 积分 +15 能量）
+
+    letter_map 把内部 key 映射成显示字母（a/b/c/d 按位置分配，和组名无关）。
+    """
+    if key in ("claimed", "done_daily"):
+        return GROUP_NAMES[key], "　（%d 个）" % len(glist)
     c = sum(it["credit"] for it in glist)
     e = sum(it["energy"] for it in glist)
     if c and e:
@@ -433,17 +662,24 @@ def group_head(key, glist):
         sub = "　（%d 个，共 +%d 能量）" % (len(glist), e)
     else:
         sub = "　（%d 个）" % len(glist)
-    name = "%s %s" % (key, GROUP_NAMES[key]) if key in LETTERED else GROUP_NAMES[key]
+    if key in LETTERED and letter_map:
+        name = "%s %s" % (letter_map[key], GROUP_NAMES[key])
+    elif key in LETTERED:
+        name = "%s %s" % (key, GROUP_NAMES[key])
+    else:
+        name = GROUP_NAMES[key]
     return name, sub
 
 
 def render(items, acc, energy, daily_only=False):
-    """打印带编号的清单，返回 (index, groups)。
+    """打印带编号的清单，返回 (index, groups, letter_map)。
 
-    分组固定顺序：已经领过的 → 手动任务（这两段只展示，不编号、选不了）
-    → a 限时 → b 每日 → c 已完成待领 → d 不限时。字母可以直接当命令用：输 a 就把 a 组全做掉。
-    index  编号 → 条目（只有带字母的四段才有编号）
-    groups 字母 → 该组条目（供按组执行）
+    分组固定顺序：已经领过的 → 手动任务 → 已完成的每日任务（前三段只展示，不编号、选不了）
+    → a 每日 → b 限时 → c 已完成待领 → d 不限时。字母按显示位置动态分配（谁排第一谁是 a），
+    可以直接当命令用：输 a 就把 a 组全做掉。
+    index       编号 → 条目（只有带字母的四段才有编号）
+    groups      内部 key → 该组条目（供按组执行）
+    letter_map  内部 key → 显示字母（如 {"a":"a","b":"b",...}，字母动态分配）
     """
     items = sorted(items, key=sort_key)
 
@@ -478,6 +714,11 @@ def render(items, acc, energy, daily_only=False):
     num = 0
     index = {}
     groups = {}
+    # 字母按显示位置动态分配：谁排第一个谁就是 a，和组名无关
+    letter_map = {}          # 内部 key → 显示字母
+    for k in GROUP_ORDER:
+        if k in LETTERED:
+            letter_map[k] = "abcd"[len(letter_map)]
     prev_key = None
     for key in GROUP_ORDER:
         glist = buckets.get(key, [])
@@ -489,9 +730,9 @@ def render(items, acc, energy, daily_only=False):
         name_w = pick_name_width(glist)
         if key in LETTERED:
             groups[key] = glist
-        gname, sub = group_head(key, glist)
-        # 「手动任务」紧贴在「已经领过的」下面（中间不空行），其余每段前空一行
-        if not (key == "manual" and prev_key == "claimed"):
+        gname, sub = group_head(key, glist, letter_map)
+        # 「手动任务」「已完成的每日任务」都紧贴上一组下面（不空行），其余每段前空一行
+        if key not in ("manual", "done_daily"):
             print()
         prev_key = key
         # 可选的段（带字母 a/b/c/d）用 = 起头，醒目；只展示、选不了的段（已领过 / 手动任务）
@@ -525,18 +766,27 @@ def render(items, acc, energy, daily_only=False):
         print("  今天的每日任务都已经领过了，明天再来。")
         print()
     print("-" * W)
-    return index, groups
+    return index, groups, letter_map
 
 
 # --------------------------------------------------------------------------
 # 选择解析
 # --------------------------------------------------------------------------
-def parse_selection(s, index, groups):
+def parse_selection(s, index, groups, letter_map=None):
     """把 "1,3,5" / "1-5" / "a" / "a c" / "0" 解析成条目列表。
 
-    返回 (items, 错误说明)。groups 是 render 给的「字母 → 该组条目」。
+    返回 (items, 错误说明)。groups 是 render 给的「内部 key → 该组条目」。
+    letter_map 是 render 给的「内部 key → 显示字母」反向映射后用来把
+    用户输入的字母（a/b/c/d 按位置分配）翻译回内部 key。
     """
     s = s.strip().lower().replace("，", ",").replace("、", ",")
+    # 反向映射：用户输入的显示字母（a/b/c/d 按位置分配）→ 内部 key
+    if letter_map:
+        rev = {v: k for k, v in letter_map.items()}
+    else:
+        rev = {k: k for k in LETTERED}
+    avail = sorted(rev.keys())           # 用户可见的字母集，排序后 "abcd"
+
     if s == "0":
         picked = [index[i] for i in sorted(index) if index[i]["auto"]]
         if not picked:
@@ -547,12 +797,9 @@ def parse_selection(s, index, groups):
     for part in re.split(r"[,\s]+", s):
         if not part:
             continue
-        if len(part) == 1 and part in LETTERED:
-            letters.append(part)
+        if len(part) == 1 and part in rev:
+            letters.append(rev[part])         # 存内部 key
             continue
-        if part == "e":
-            return None, ("「e」这个字母已经不用了 —— 手动任务（脚本做不了）"
-                          "只列在清单最上面，要你自己在客户端里做。")
         m = re.fullmatch(r"(\d+)-(\d+)", part)
         if m:
             a, b = int(m.group(1)), int(m.group(2))
@@ -560,20 +807,20 @@ def parse_selection(s, index, groups):
                 a, b = b, a
             nums += list(range(a, b + 1))
             continue
-        ls = "".join(LETTERED)
+        ls = "".join(avail)
         m = re.fullmatch(r"([%s])-([%s])" % (ls, ls), part)
         if m:
-            i, j = LETTERED.index(m.group(1)), LETTERED.index(m.group(2))
+            i, j = avail.index(m.group(1)), avail.index(m.group(2))
             if i > j:
                 i, j = j, i
-            letters += list(LETTERED[i:j + 1])
+            letters += [rev[c] for c in avail[i:j + 1]]
             continue
         if part.isdigit():
             nums.append(int(part))
             continue
         return None, ("看不懂「%s」—— 可以输编号（1 3 5）或范围（4-8），"
                       "整组（%s，也可写 a-b）、0（全部能做的）"
-                      % (part, " ".join(LETTERED)))
+                      % (part, " ".join(avail)))
 
     for k in letters:
         glist = groups.get(k)
@@ -596,26 +843,154 @@ def parse_selection(s, index, groups):
 # --------------------------------------------------------------------------
 # 执行
 # --------------------------------------------------------------------------
+def _exec_school_lottery(auth):
+    """真实执行开学季抽奖：查余额 → 循环抽到空 → 返回 entry。
+
+    复用 school_open_day_2026 的 fetch_lottery_config / post_lottery_draw /
+    lottery_prize_text，不重复实现抽奖逻辑。返回 entry 给 render_accounts 显示。
+    """
+    import school_open_day_2026 as sk
+    import uuid
+
+    try:
+        cfg, chance = sk.fetch_lottery_config(auth["token"])
+    except Exception as e:
+        return {"state": "fail", "note": "抽奖查询失败：%s" % e,
+                "credit": 0, "energy": 0, "cur": 0, "tgt": 0}
+
+    if not cfg.get("in_period"):
+        return {"state": "already", "note": "活动已结束",
+                "credit": 0, "energy": 0, "cur": 0, "tgt": 0}
+
+    bal = chance.get("balance") or 0
+    if bal <= 0:
+        return {"state": "already", "note": "无抽奖机会",
+                "credit": 0, "energy": 0, "cur": 0, "tgt": 0}
+
+    results = []
+    total_credit = 0
+    prev_bal = bal
+    stall = 0
+    while bal > 0:
+        draw_uuid = str(uuid.uuid4())
+        try:
+            st, r = sk.post_lottery_draw(auth["token"], draw_uuid)
+        except Exception:
+            break
+        if st != 200 or (isinstance(r, dict) and r.get("code") not in sk.OK_CODES):
+            code = (r or {}).get("code") if isinstance(r, dict) else None
+            if code == 40900:          # no chance，正常边界
+                bal = 0
+                break
+            break                       # 其他错误，停
+        d = (r or {}).get("data") or {}
+        prize_code = d.get("prize_code") or "?"
+        credit = d.get("credit_amount") or 0
+        bal = d.get("chance_balance", bal)
+        if bal >= prev_bal:             # 余额未降：防死循环
+            stall += 1
+            if stall >= 3:
+                break
+        else:
+            stall = 0
+        prev_bal = bal
+        pinfo = sk.LOTTERY_PRIZE_LABELS.get(prize_code, {})
+        results.append({"label": pinfo.get("label", prize_code),
+                        "type": pinfo.get("type", "unknown"),
+                        "credit": credit})
+        total_credit += credit
+        if bal > 0:
+            time.sleep(1.0)             # 间隔，防频控
+
+    if results:
+        vouchers = [r for r in results if r["type"] == "voucher"]
+        # 主行 note：积分总和 + 兑换券计数（不管什么券，并入到兑换券N张）
+        parts = []
+        if total_credit > 0:
+            parts.append("+%d积分" % total_credit)
+        if vouchers:
+            parts.append("兑换券×%d" % len(vouchers))
+        note = "抽%d次：%s" % (len(results), "，".join(parts)) if parts else "抽%d次" % len(results)
+        # detail 行：券名顿号分隔，后缀只在末尾显示一次
+        if vouchers:
+            names = "、".join(r["label"] for r in vouchers)
+            detail = "中奖券：%s（前往小程序活动页领取）" % names
+        else:
+            detail = ""
+    else:
+        note = "抽了但没中奖"
+        detail = ""
+    # 余额归零=抽完(ok)；中途停=未抽完(pending)
+    state = "ok" if bal == 0 else "pending"
+    return {"state": state, "note": note, "credit": total_credit,
+            "energy": 0, "cur": 0, "tgt": 0, "detail": detail}
+
+
+def _exec_feat(acc, feat_items, parsed):
+    """执行 feat_* 功能行。
+
+    feat_school_lottery → 真实抽奖（_exec_school_lottery）；
+    其余 → stub（开发中，本期暂不执行）。
+    """
+    if parsed is None:
+        accounts, unparsed, totals, mode = [], [], {}, ""
+    else:
+        accounts, unparsed, totals, mode = parsed
+
+    uid8 = acc["prefix"]
+    acc_entry = next((a for a in accounts if a["uid"].startswith(uid8)), None)
+    if acc_entry is None:
+        acc_entry = {"uid": acc.get("uid", uid8),
+                     "nick": acc.get("nick", ""), "energy": None, "tasks": {}}
+        accounts.append(acc_entry)
+
+    auth = tc.load_auth(acc["prefix"])
+    for it in feat_items:
+        code = it["code"]
+        if code == "feat_school_lottery":
+            acc_entry["tasks"][code] = _exec_school_lottery(auth)
+        else:
+            acc_entry["tasks"][code] = {
+                "state": "skip", "note": "开发中，本期暂不执行",
+                "credit": 0, "energy": 0,
+                "cur": it.get("cur"), "tgt": it.get("target"),
+            }
+
+    return (accounts, unparsed, totals, mode)
+
+
 def exec_selected(acc, picked):
     """跑一个账号挑中的任务。
 
     返回 (parsed, raw)：parsed = (accounts, unparsed, totals, mode)；执行异常时为 None。
+    feat_* 功能行不走 task_runner，由 _exec_feat 执行（lottery 真实抽，其余 stub）。
     """
-    codes = [it["code"] for it in picked]
-    cmd = [PY, "-u", os.path.join(HERE, "task_runner.py"),
-           acc["prefix"], "--yes", "--gap", "1.0"]
-    for c in codes:
-        cmd += ["--only", c]
+    feat_items = [it for it in picked if it["code"] in FEAT_CODES]
+    real_items = [it for it in picked if it["code"] not in FEAT_CODES]
 
-    try:
-        p = subprocess.run(cmd, cwd=ROOT, capture_output=True, text=True, timeout=1800)
-    except subprocess.TimeoutExpired:
-        return None, ""
-    raw = (p.stdout or "") + (p.stderr or "")
-    try:
-        return zh.parse_logs(raw), raw
-    except Exception:
-        return None, raw
+    raw = ""
+    parsed = None
+    if real_items:
+        codes = [it["code"] for it in real_items]
+        cmd = [PY, "-u", os.path.join(HERE, "task_runner.py"),
+               acc["prefix"], "--yes", "--gap", "1.0"]
+        for c in codes:
+            cmd += ["--only", c]
+        try:
+            p = subprocess.run(cmd, cwd=ROOT, capture_output=True,
+                               text=True, timeout=1800)
+        except subprocess.TimeoutExpired:
+            return None, ""
+        raw = (p.stdout or "") + (p.stderr or "")
+        try:
+            parsed = zh.parse_logs(raw)
+        except Exception:
+            parsed = None
+
+    if feat_items:
+        parsed = _exec_feat(acc, feat_items, parsed)
+
+    return parsed, raw
 
 
 def refine_daily(parsed_acc, picked):
@@ -703,6 +1078,10 @@ def run_all(accounts, daily_only=False):
     # ── 2) 逐个执行 ──
     blocks, notes, totals, results = [], {}, {}, []
     had_error = False
+    # 余额对账：跑前/跑后真实余额差，覆盖解析层盲区（school claim/抽奖不带 credit= 字段）。
+    # ledger_ok=False（一个号都没对上账）时回退到逐任务相加（grand_c）。
+    ledger = {"credit": 0, "energy": 0}
+    ledger_ok = False
 
     for i, (acc, pool, err) in enumerate(plan, 1):
         name = acc["nick"] or acc["prefix"]
@@ -738,6 +1117,13 @@ def run_all(accounts, daily_only=False):
                   "全都要手动做", "要手动做")
             continue
 
+        # 跑前余额（积分+能量），跑后再读一次，差值=本轮真实入账
+        try:
+            auth = tc.load_auth(acc["prefix"])
+        except Exception:
+            auth = None
+        before = _balances(auth) if auth else (None, None)
+
         parsed, raw = exec_selected(acc, runnable)
         if parsed is None or not parsed[0]:
             had_error = True
@@ -751,10 +1137,35 @@ def run_all(accounts, daily_only=False):
         pa = next((x for x in pacs if x["uid"].startswith(acc["prefix"])), pacs[0])
         if daily_only:
             refine_daily(pa, runnable)       # 夜猫子那类累计型的进度对比
+        # school 域 claim 日志不带 credit= 字段，解析层拿不到入账数；用任务清单里的
+        # reward_credit 把「本轮新完成」的 school 任务补上（余额对账是权威总数，
+        # 这里只是逐任务明细的兜底，让单账号小结也能看到 +X 积分）。
+        for it in runnable:
+            e = pa["tasks"].get(it["code"])
+            if not e or e.get("state") != "ok":
+                continue
+            if e.get("credit") or e.get("energy"):
+                continue                      # 解析层已拿到真实入账值（growth claim）
+            if it.get("credit") or it.get("energy"):
+                e["credit"] = it["credit"]
+                e["energy"] = it["energy"]
+                e["note"] = "完成并入账"
         for it in manual:                    # 手动任务也列出来，免得看着像"全做完了"
             pa["tasks"].setdefault(it["code"], {
                 "state": "blocked", "note": it["why"] or "要你手动做",
                 "credit": 0, "energy": 0, "cur": None, "tgt": None})
+        # 跑后余额 → 入账增量（只计正增量；负增量=消耗，不算入账）
+        after = _balances(auth) if auth else (None, None)
+        d_c = _delta(before[0], after[0])
+        d_e = _delta(before[1], after[1])
+        if before[0] is not None and after[0] is not None:
+            ledger_ok = True
+        if d_c > 0:
+            ledger["credit"] += d_c
+        if d_e > 0:
+            ledger["energy"] += d_e
+        if after[1] is not None:
+            pa["energy"] = after[1]
         ok, text = zh.account_verdict(pa, "%s %d 个" % (label, len(pool)))
         pa["verdict"] = text
         blocks.append(pa)
@@ -773,7 +1184,9 @@ def run_all(accounts, daily_only=False):
             len(results), len(done), len(rest))
         if rest:
             headline += "（%s）" % "、".join(r[0] for r in rest[:4])
-    print(zh.render_accounts(blocks, [], totals, "", headline=headline, notes=notes))
+    print(zh.render_accounts(blocks, [], totals, "", headline=headline,
+                             notes=notes,
+                             ledger=ledger if ledger_ok else None))
     return not had_error
 
 
@@ -886,7 +1299,7 @@ def pick_account(accounts):
             print("  × 没看懂。请输入 1 ~ %d 选账号，或 n / j / k / r / q。" % n)
 
 
-TITLE = "WorkBuddy 成长计划任务自动执行脚本"
+TITLE = "WorkBuddy 任务助手"
 
 
 def banner():
@@ -965,7 +1378,7 @@ def main():
                 print("  查询完成，用时 %.1f 秒。" % (time.time() - t0))
                 task_hint()
 
-            index, groups = render(items, acc, energy, False)
+            index, groups, letter_map = render(items, acc, energy, False)
             print("  要做什么？")
             print("  *支持多选/混合输入(空格/顿号/逗号)")
             print("  执行全部可执行任务 : 0          换账号 : t          退出 : q")
@@ -981,7 +1394,7 @@ def main():
             if not s:
                 continue
 
-            picked, err = parse_selection(s, index, groups)
+            picked, err = parse_selection(s, index, groups, letter_map)
             if err:
                 print()
                 print("  × %s" % err)
@@ -992,7 +1405,8 @@ def main():
             if len(keys) == 1:
                 g = keys.pop()
                 if g in LETTERED:
-                    tail = "（%s %s）" % (g, GROUP_NAMES[g])
+                    disp = letter_map.get(g, g) if letter_map else g
+                    tail = "（%s %s）" % (disp, GROUP_NAMES[g])
             print()
             if all(not it["auto"] for it in picked):
                 print("  × 这 %d 个任务脚本都做不了，得你自己在客户端里做：" % len(picked))
@@ -1013,13 +1427,38 @@ def main():
                 print("  注意：其中有脚本做不了的任务，会如实跳过，不影响其他任务。")
             print()
             print("  正在执行，请稍候（每个任务几秒到十几秒，中途没有输出是正常的）……")
+            try:
+                auth = tc.load_auth(acc["prefix"])
+            except Exception:
+                auth = None
+            before = _balances(auth) if auth else (None, None)
             parsed, raw = exec_selected(acc, picked)
             print()
             if parsed and parsed[0]:
                 pacs, unparsed, tot, mode = parsed
                 pa = next((x for x in pacs if x["uid"].startswith(acc["prefix"])), pacs[0])
                 refine_daily(pa, picked)
-                print(zh.render_accounts([pa], unparsed, tot, mode))
+                # school 域 claim 日志不带 credit=：用任务清单 reward_credit 兜底
+                for it in picked:
+                    e = pa["tasks"].get(it["code"])
+                    if not e or e.get("state") != "ok":
+                        continue
+                    if e.get("credit") or e.get("energy"):
+                        continue
+                    if it.get("credit") or it.get("energy"):
+                        e["credit"] = it["credit"]
+                        e["energy"] = it["energy"]
+                        e["note"] = "完成并入账"
+                # 跑前/跑后余额对账真实入账
+                after = _balances(auth) if auth else (None, None)
+                d_c = _delta(before[0], after[0])
+                d_e = _delta(before[1], after[1])
+                ledger_ok = before[0] is not None and after[0] is not None
+                ledger = ({"credit": d_c, "energy": d_e}
+                          if ledger_ok else None)
+                if after[1] is not None:
+                    pa["energy"] = after[1]
+                print(zh.render_accounts([pa], unparsed, tot, mode, ledger=ledger))
             else:
                 print(raw or "  ✗ 没有拿到执行结果。")
             print()

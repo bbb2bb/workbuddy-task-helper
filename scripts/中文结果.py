@@ -6,7 +6,7 @@
 本脚本只读它的输出、重新组织，输出一张「每个任务一行」的中文表格。
 
 两种用法：
-  1) 命令行管道（③一键完成全部任务 用）：
+  1) 命令行管道：
          python3 -u scripts/task_runner.py ALL --yes 2>&1 | python3 scripts/中文结果.py
   2) 被 任务助手.py 导入：
          parse_logs(raw)        -> 结构化结果
@@ -44,6 +44,11 @@ CODE_NAMES = {
     "school_season": "校园日",
     # 官方后加、脚本暂不处理的任务（出现时按原名兜底）
     "wb_wechat_oa_subscribe_task": "关注微信服务号",
+    # feat_* 功能行（脚本新增，非官方任务 code）
+    "feat_checkin": "每日签到",
+    "feat_travel": "猫猫旅行",
+    "feat_school_lottery": "开学季小程序抽奖",
+    "feat_streak": "活跃地图",
 }
 
 # 每天最多计入 1 次、要累计多天的任务 —— 进度单位是「天」不是「次」
@@ -52,9 +57,12 @@ CUMULATIVE_DAILY = {"black_cat"}
 
 # 状态优先级：数值大的最终胜出（一个任务会打多行，取最终结论）
 STATE_RANK = {
+    # partial（领奖失败）排在 ok（点亮）之上：school 域点亮的日志会先打一句
+    # 「（点亮）」(ok)，紧跟 claim 失败时再打一句「claim 失败」(partial)；
+    # 若 partial 不压过 ok，失败的那次会被错显示成「已完成」——与事实相反。
+    "partial": 101,  # 任务完成了，但领奖没成功
     "ok": 100,       # 这次真的完成并领到了
     "part": 96,      # 进度涨了，但任务本身还没满（累计型任务）
-    "partial": 95,   # 任务完成了，但领奖没成功
     "already": 90,   # 之前已经领过 / 今天的份额已经算过
     "fail": 80,
     "blocked": 70,   # 做不了（需要真人动作）
@@ -62,21 +70,6 @@ STATE_RANK = {
     "skip": 60,
     "absent": 30,    # 这个号压根没有这个任务
     "unknown": 10,
-}
-
-# 状态 → 符号。**结果屏已经不用符号了**（2026-09-21 已定案：状态词就够了），
-# 这里保留是为了一旦想退回符号版能直接取用；改 STATE_RANK 时仍然顺手同步一下。
-MARK = {
-    "ok": "✓",
-    "part": "◐",
-    "partial": "~",
-    "already": "-",
-    "skip": "·",
-    "fail": "!",
-    "blocked": "×",
-    "pending": "○",
-    "absent": "∅",
-    "unknown": "?",
 }
 
 # 结果屏上每行显示的状态词（不用符号，因为后面本来就跟了说明）
@@ -382,11 +375,14 @@ RES_W = 78                  # 结果屏宽度：跟清单屏（任务助手.py �
 
 
 def render_accounts(accounts, unparsed=None, totals=None, mode="",
-                    headline=None, notes=None):
+                    headline=None, notes=None, ledger=None):
     """把解析结果排成给人看的文字，返回字符串。
 
     headline  顶部总述（多账号汇总用），如「全部 3 个账号的每日任务都做到了」
     notes     {uid 前缀: 追加在账号标题下的一行小结论}
+    ledger    {credit, energy} —— 跑前/跑后真实余额对账得到的入账增量；
+              给了就以此为准（覆盖逐任务相加的 grand_c，因为后者解析不到
+              school 域 claim / 抽奖等没有 credit= 字段的入账）。
 
     版式：整屏跟清单屏一样按 RES_W(=78) 列排。每行 =
         缩进 + 任务名（不够补点）+ 状态词一列 + 说明
@@ -444,9 +440,11 @@ def render_accounts(accounts, unparsed=None, totals=None, mode="",
             word = STATE_WORD.get(t["state"], "读不到")
             tail = t["note"]
             if t["state"] == "ok" and (t["credit"] or t["energy"]):
-                tail = "+%d 积分" % t["credit"]
-                if t["energy"]:
-                    tail += " +%d 能量" % t["energy"]
+                # feat_* 行的 note 含抽奖券明细等，不覆盖成「+X积分」
+                if not code.startswith("feat_"):
+                    tail = "+%d 积分" % t["credit"]
+                    if t["energy"]:
+                        tail += " +%d 能量" % t["energy"]
                 grand_c += t["credit"]
                 grand_e += t["energy"]
             if not tail:
@@ -457,11 +455,23 @@ def render_accounts(accounts, unparsed=None, totals=None, mode="",
             if width(tail) > room:
                 tail = clip(tail, max(4, room - 1)) + "…"
             out.append(head + tail)
+            # feat_* 行有券明细（detail）时，单独一行显示，不受 name 列宽度限制
+            if code.startswith("feat_") and t.get("detail"):
+                out.append("    └ " + t["detail"])
         out.append("")
 
     out.append("-" * RES_W)
     if totals:
-        if grand_c or grand_e:
+        # 余额对账（ledger）优先：跑前/跑后真实余额差，覆盖解析层盲区
+        # （school 域 claim / 抽奖等日志不带 credit= 字段，逐任务相加会漏）。
+        if ledger is not None:
+            rc = ledger.get("credit") or 0
+            re_ = ledger.get("energy") or 0
+            if rc or re_:
+                out.append("  本次一共入账：+%d 积分 +%d 能量（按余额对账）" % (rc, re_))
+            else:
+                out.append("  本次余额没有变化（任务可能已领过，或奖励未即时到账）。")
+        elif grand_c or grand_e:
             out.append("  这次一共领到：+%d 积分 +%d 能量" % (grand_c, grand_e))
         else:
             out.append("  这次没有新的积分入账。")
@@ -500,8 +510,8 @@ def main():
     if not accounts:
         out = ["没有读到任何账号信息。", "",
                "可能原因：",
-               "  1) 还没有登录 —— 请先双击「①登录账号（双击我）.command」",
-               "  2) 登录凭证已过期 —— 重新双击「①」即可", ""]
+               "  1) 还没有登录 —— 回到第一屏按 n 登录",
+               "  2) 登录凭证已过期 —— 回到第一屏按 n 重新登录", ""]
         if unparsed:
             out.append("原始输出：")
             out.extend("  " + x for x in unparsed[:20])
